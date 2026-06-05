@@ -80,4 +80,6 @@ Filament indices survive mesh repair via a KD-tree snapshot taken before any bme
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
+[GPL-3.0-or-later](LICENSE)
+
+This addon imports `bpy`, `bmesh`, and `mathutils` — GPL-licensed components of Blender. Under the GPL, any program that links against GPL code must itself be GPL-licensed. No code was copied from other addons; the GPL applies here because of the Blender API dependency.
