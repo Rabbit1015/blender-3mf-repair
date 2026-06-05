@@ -1,6 +1,6 @@
 # Blender 3MF Repair Addon
 
-A Blender 4.5 addon that imports BambuStudio `.3mf` files, repairs non-manifold mesh geometry, and exports back as an OrcaSlicer-compatible `.3mf` — with all filament colors preserved.
+A Blender 4.5 addon that imports `.3mf` files, repairs non-manifold mesh geometry, and exports back as an slicer compatible `.3mf` — with all filament colors preserved.
 
 Built for multi-color FDM printing on machines like the Snapmaker U1 (11-color) using OrcaSlicer.
 
