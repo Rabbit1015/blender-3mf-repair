@@ -542,26 +542,18 @@ class REPAIR_OT_mesh(bpy.types.Operator):
         filled_new = 0
 
         def _fill_and_clean(bm):
-            """One fill round: holes_fill, then triangle_fill fallback, then safety."""
+            """Fill one round using triangle_fill only — produces triangles
+            directly, avoiding n-gon faces whose export-time triangulation
+            can create coincident-diagonal multi-face edges in the 3MF."""
             bm.edges.ensure_lookup_table()
             be = [e for e in bm.edges if e.is_boundary]
             if not be:
                 return 0, 0
 
-            # Primary: holes_fill
-            res = bmesh.ops.holes_fill(bm, edges=be, sides=0)
-            n = len(res.get('faces', []))
+            res = bmesh.ops.triangle_fill(bm, use_beauty=True, use_dissolve=False, edges=be)
+            n = len([g for g in res.get('geom', []) if isinstance(g, bmesh.types.BMFace)])
 
-            # Fallback: triangle_fill for loops holes_fill skipped
-            bm.edges.ensure_lookup_table()
-            be2 = [e for e in bm.edges if e.is_boundary]
-            if be2:
-                res2 = bmesh.ops.triangle_fill(
-                    bm, use_beauty=True, use_dissolve=False, edges=be2)
-                n += len([g for g in res2.get('geom', [])
-                          if isinstance(g, bmesh.types.BMFace)])
-
-            # Remove degenerate faces
+            # Remove degenerate zero-area faces
             bm.faces.ensure_lookup_table()
             degen = [f for f in bm.faces if f.calc_area() < 1e-14]
             if degen:
@@ -586,11 +578,11 @@ class REPAIR_OT_mesh(bpy.types.Operator):
             if n == 0 and cleaned == 0:
                 break
 
-        # Absolute last resort: any boundary edges that survived every fill
-        # algorithm are geometrically degenerate (broken loops or conflicting
-        # topology).  Delete their adjacent faces and the resulting wire edges
-        # so the mesh has zero boundary edges — 3 missing faces out of 329k
-        # is invisible and won't affect slicing.
+        # Last resort: delete faces whose boundary edges no fill algorithm could close.
+        # After deletion the former manifold-neighbours become boundary; a second fill
+        # round below handles those new (simpler) loops entirely inside bmesh so we
+        # never need Edit Mode — avoiding the n-gon / duplicate-face issues that
+        # Edit Mode fill() / fill_holes() introduced in exported 3MF files.
         bm.edges.ensure_lookup_table()
         stubborn = [e for e in bm.edges if e.is_boundary]
         if stubborn:
@@ -606,48 +598,79 @@ class REPAIR_OT_mesh(bpy.types.Operator):
             if isolated:
                 bmesh.ops.delete(bm, geom=isolated, context='VERTS')
 
+            # Second fill round: the new boundary loops left by last-resort deletion
+            # are geometrically simpler than the originals; bmesh can usually fill them.
+            for _r2 in range(10):
+                bm.edges.ensure_lookup_table()
+                if not any(e.is_boundary for e in bm.edges):
+                    break
+                n2, c2 = _fill_and_clean(bm)
+                filled_new += n2
+                print(f"[3MF] fill-r2 round {_r2}: +{n2} faces, safety -{c2}")
+                if n2 == 0 and c2 == 0:
+                    break
+
+            # If any boundary loops still survived, delete them too.
+            bm.edges.ensure_lookup_table()
+            stubborn2 = [e for e in bm.edges if e.is_boundary]
+            if stubborn2:
+                stub2_faces = list({f for e in stubborn2 for f in e.link_faces})
+                bmesh.ops.delete(bm, geom=stub2_faces, context='FACES_ONLY')
+                bm.edges.ensure_lookup_table()
+                wire2 = [e for e in bm.edges if len(e.link_faces) == 0]
+                if wire2:
+                    bmesh.ops.delete(bm, geom=wire2, context='EDGES')
+
+        # Duplicate-face removal: fill ops can lay a new triangle over an existing
+        # one; same vertex set + same winding → non-contiguous in OrcaSlicer.
+        bm.faces.ensure_lookup_table()
+        seen_faces = {}
+        dup_faces = []
+        for f in bm.faces:
+            key = frozenset(v.index for v in f.verts)
+            if key in seen_faces:
+                dup_faces.append(f)
+            else:
+                seen_faces[key] = f
+        if dup_faces:
+            bmesh.ops.delete(bm, geom=dup_faces, context='FACES_ONLY')
+            bm.edges.ensure_lookup_table()
+            wire_d = [e for e in bm.edges if len(e.link_faces) == 0]
+            if wire_d:
+                bmesh.ops.delete(bm, geom=wire_d, context='EDGES')
+            print(f"[3MF] removed {len(dup_faces)} duplicate faces")
+
+        # Fix non-contiguous (wrong-winding) fill faces.
+        # triangle_fill doesn't guarantee its output winding matches the surrounding
+        # mesh.  Now that the mesh has 0 boundary and 0 multi-face edges, the BFS
+        # inside recalc_face_normals can safely propagate consistent orientation
+        # across the whole mesh — the few wrong-winding fill triangles get corrected
+        # without cascading side effects.  We skip it if any boundary or multi-face
+        # edges remain, since those break the BFS and could flip half the mesh.
+        bm.edges.ensure_lookup_table()
+        pre_recalc_nm = sum(1 for e in bm.edges if not e.is_manifold)
+        still_boundary  = sum(1 for e in bm.edges if e.is_boundary)
+        still_multiface = sum(1 for e in bm.edges if len(e.link_faces) > 2)
+        ran_recalc = False
+        if still_boundary == 0 and still_multiface == 0:
+            bm.faces.ensure_lookup_table()
+            bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
+            ran_recalc = True
+        bm.edges.ensure_lookup_table()
+        post_recalc_nm = sum(1 for e in bm.edges if not e.is_manifold)
+
         bm.to_mesh(mesh)
         bm.free()
         mesh.update()
 
-        # Last-resort fallback: Edit Mode fill for loops that bmesh algorithms skip.
-        # Uses a different code path (ear-clipping) that handles non-planar/
-        # complex boundary loops bmesh.holes_fill refuses to touch.
-        try:
-            bpy.ops.object.mode_set(mode='EDIT')
-            bpy.ops.mesh.select_all(action='DESELECT')
-            bpy.ops.mesh.select_non_manifold(
-                extend=False, use_wire=False, use_boundary=True,
-                use_multi_face=False, use_non_contiguous=False, use_verts=False)
-            bpy.ops.mesh.fill()          # ear-clip fill of selected boundary
-            bpy.ops.mesh.select_all(action='SELECT')
-            bpy.ops.mesh.fill_holes(sides=0)   # belt-and-braces pass
-            bpy.ops.object.mode_set(mode='OBJECT')
-            mesh.update()
-        except Exception as e:
-            print(f"[3MF] Edit Mode fill fallback: {e}")
-            try:
-                bpy.ops.object.mode_set(mode='OBJECT')
-            except Exception:
-                pass
-
-        # --- Step 5b: Fix non-manifold vertices (bowtie topology) ---------------
-        # The fill passes above create 0 NM edges in Blender, but OrcaSlicer also
-        # checks vertices: a "bowtie" vertex where two disconnected face fans share
-        # a single point counts as ~2 NM edges per vertex in OrcaSlicer's validator.
-        # Fix: for each such vertex, create a new vertex copy for every extra fan so
-        # each fan gets its own vertex.  New vertices are placed at the same position,
-        # so the KD-tree filament lookup still works correctly afterwards.
+        # --- Step 5b: Fix non-manifold (bowtie) vertices ---
 
         def _split_nm_vert(bm_local, v):
-            """Split a bowtie vertex into one vertex per connected face fan.
-            Returns the number of extra fans (= new vertices created)."""
             if v.is_manifold:
                 return 0
             faces = list(v.link_faces)
             if not faces:
                 return 0
-            # BFS: group adjacent faces into fans connected through edges at v
             fans, remaining = [], set(faces)
             while remaining:
                 seed = next(iter(remaining))
@@ -683,16 +706,26 @@ class REPAIR_OT_mesh(bpy.types.Operator):
 
         bm3 = bmesh.new()
         bm3.from_mesh(mesh)
+        bm3.edges.ensure_lookup_table()
         bm3.verts.ensure_lookup_table()
-        nm_v_list = [v for v in bm3.verts if not v.is_manifold]
-        fixed_fans = sum(_split_nm_vert(bm3, v) for v in nm_v_list)
-        if fixed_fans:
-            bm3.verts.ensure_lookup_table()
-            bm3.edges.ensure_lookup_table()
-            nm_v_after = sum(1 for v in bm3.verts if not v.is_manifold)
-            nm_e_after = sum(1 for e in bm3.edges if not e.is_manifold)
-            print(f"[3MF] vertex fix: split {fixed_fans} extra fans, "
-                  f"{nm_v_after} NM verts / {nm_e_after} NM edges remaining")
+        pre_bm3_nm   = sum(1 for e in bm3.edges if not e.is_manifold)
+        pre_bm3_nmv  = sum(1 for v in bm3.verts if not v.is_manifold)
+        fixed_fans   = sum(_split_nm_vert(bm3, v)
+                           for v in [v for v in bm3.verts if not v.is_manifold])
+        # The split leaves wire edges (0 faces) where the old bowtie vertex
+        # connected to the fan that was moved to the new vertex.  Clean them.
+        bm3.edges.ensure_lookup_table()
+        wire3 = [e for e in bm3.edges if len(e.link_faces) == 0]
+        if wire3:
+            bmesh.ops.delete(bm3, geom=wire3, context='EDGES')
+        bm3.verts.ensure_lookup_table()
+        iso3 = [v for v in bm3.verts if len(v.link_edges) == 0]
+        if iso3:
+            bmesh.ops.delete(bm3, geom=iso3, context='VERTS')
+        bm3.edges.ensure_lookup_table()
+        bm3.verts.ensure_lookup_table()
+        post_bm3_nm  = sum(1 for e in bm3.edges if not e.is_manifold)
+        post_bm3_nmv = sum(1 for v in bm3.verts if not v.is_manifold)
         bm3.to_mesh(mesh)
         bm3.free()
         mesh.update()
